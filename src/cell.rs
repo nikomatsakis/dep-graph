@@ -8,8 +8,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::cell::{Cell, UnsafeCell};
-use std::rc::Rc;
+use std::cell::{Cell, RefCell, RefMut, Ref};
+use std::collections::HashSet;
 
 use super::{DepGraph, DepNodeName, DepNodeIndex};
 use super::safe::DepGraphSafe;
@@ -18,137 +18,113 @@ use super::safe::DepGraphSafe;
 /// we make calls to `read` and `write` as appropriate. We key the
 /// maps with a unique type for brevity.
 pub struct DepCell<T> {
-    data: Rc<DepCellData<T>>
-}
-
-struct DepCellData<T> {
     state: Cell<State>,
-    value: UnsafeCell<T>,
-}
-
-// This trait is used to allow us to interact with a `DepCellData`
-// without knowing the precise value `T`.
-trait DepCellDataTrait {
-    fn state(&self) -> &Cell<State>;
+    value: RefCell<T>,
 }
 
 #[derive(Copy, Clone, Debug)]
 enum State {
     Unlocked(DepNodeIndex),
-    ReadLocked(TaskId),
-    WriteLocked(TaskId),
+    Locked(TaskId),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct TaskId(usize);
 
-impl<T> Clone for DepCell<T> {
-    fn clone(&self) -> Self {
-        DepCell { data: self.data.clone() }
-    }
-}
-
 impl<N> DepGraph<N>
     where N: DepNodeName
 {
-    pub fn cell_task<'data, C, A, R>(
+    pub fn cell_task<'cx, C, A, R>(
         &self,
         cx: C,
         arg: A,
-        user_task_fn: for<'task> fn(C, A, &mut Task<'task, 'data, N>) -> R)
+        user_task_fn: for<'task> fn(C, A, &mut Task<'task, 'cx, N>) -> R)
         -> R
-        where C: DepGraphSafe, A: DepGraphSafe
+        where C: DepGraphSafe + 'cx,
+              A: DepGraphSafe + 'cx,
     {
         let task_id = TaskId(0); // TODO fix this
-        let mut task = Task { graph: self.clone(), task_id: &task_id, locked: vec![] };
+        let mut task = Task {
+            graph: self.clone(),
+            task_id: &task_id,
+            locked: vec![],
+            read_locked_set: HashSet::new(),
+        };
         self.push_task();
         let result = user_task_fn(cx, arg, &mut task);
         let node = self.pop_task(None);
         task.release_locks(node);
         result
     }
+
+    pub fn new_cell<C, A, R>(&self,
+                             cx: C,
+                             arg: A,
+                             user_task_fn: fn(C, A) -> R)
+        -> DepCell<R>
+        where C: DepGraphSafe,
+              A: DepGraphSafe,
+    {
+        let (value, node) = self.with_anon_task(cx, arg, user_task_fn);
+        DepCell {
+            state: Cell::new(State::Unlocked(node)),
+            value: RefCell::new(value)
+        }
+    }
 }
 
-pub struct Task<'task, 'data, N>
-    where N: DepNodeName, 'data: 'task,
+pub struct Task<'task, 'cx, N>
+    where N: DepNodeName, 'cx: 'task,
 {
     graph: DepGraph<N>,
     task_id: &'task TaskId,
-    locked: Vec<Rc<DepCellDataTrait + 'data>>,
+    read_locked_set: HashSet<*const Cell<State>>,
+    locked: Vec<&'cx Cell<State>>,
 }
 
-impl<'task, 'data, N> Task<'task, 'data, N>
-    where N: DepNodeName, 'data: 'task,
+impl<'task, 'cx, N> Task<'task, 'cx, N>
+    where N: DepNodeName, 'cx: 'task,
 {
-    pub fn cell<T: 'data>(&mut self, value: T) -> (DepCell<T>, &'task mut T) {
-        let cell = DepCell {
-            data: Rc::new(DepCellData {
-                state: Cell::new(State::WriteLocked(*self.task_id)),
-                value: UnsafeCell::new(value)
-            })
-        };
-        self.locked.push(cell.data.clone());
-        (cell.clone(), unsafe { &mut *cell.data.value.get() })
-    }
-
-    pub fn borrow_mut<T: 'data>(&mut self, cell: &DepCell<T>) -> &'task mut T {
-        match cell.data.state.get() {
-            State::Unlocked(_) => { }
-            State::ReadLocked(_) | State::WriteLocked(_) => {
-                panic!("cannot write -- cell already in state {:?}", cell.data.state.get());
+    pub fn borrow_mut<T: 'cx>(&mut self, cell: &'cx DepCell<T>) -> RefMut<'cx, T> {
+        match cell.state.get() {
+            State::Unlocked(node) => {
+                self.graph.read(node);
+                cell.state.set(State::Locked(*self.task_id));
+                self.locked.push(&cell.state);
             }
-        }
 
-        match cell.data.state.replace(State::WriteLocked(*self.task_id)) {
-            State::Unlocked(u) => self.graph.read(u),
-            State::ReadLocked(_) | State::WriteLocked(_) => { }
-        }
-
-        self.locked.push(cell.data.clone());
-        unsafe { &mut *cell.data.value.get() }
-    }
-
-    pub fn borrow<T: 'data>(&mut self, cell: &DepCell<T>) -> &'task T {
-        match cell.data.state.get() {
-            State::Unlocked(_) => { }
-            State::ReadLocked(task) => {
-                if task != *self.task_id {
-                    panic!("cannot read -- cell already in state {:?}", cell.data.state.get());
+            State::Locked(task_id) => {
+                if task_id != *self.task_id {
+                    panic!("cannot write -- cell locked by another task ({:?})", task_id)
                 }
             }
-            State::WriteLocked(_) => {
-                panic!("cannot read -- cell already in state {:?}", cell.data.state.get());
+        }
+
+        cell.value.borrow_mut()
+    }
+
+    pub fn borrow<T: 'cx>(&mut self, cell: &'cx DepCell<T>) -> Ref<'cx, T> {
+        match cell.state.get() {
+            State::Unlocked(node) => {
+                self.graph.read(node);
+            }
+
+            State::Locked(task_id) => {
+                if task_id != *self.task_id {
+                    panic!("cannot read -- cell locked by another task ({:?})", task_id)
+                }
             }
         }
 
-        match cell.data.state.replace(State::ReadLocked(*self.task_id)) {
-            State::Unlocked(u) => self.graph.read(u),
-            State::ReadLocked(_) | State::WriteLocked(_) => { }
-        }
-
-        self.locked.push(cell.data.clone());
-        unsafe { &*cell.data.value.get() }
+        cell.value.borrow()
     }
 
     fn release_locks(self, node: DepNodeIndex) {
-        for locked in self.locked {
-            let locked_state = locked.state();
-            match locked_state.get() {
+        for locked_state in self.locked {
+            match locked_state.replace(State::Unlocked(node)) {
                 State::Unlocked(_) => unreachable!(),
-                State::ReadLocked(task_id) => {
-                    assert_eq!(task_id, *self.task_id);
-                }
-                State::WriteLocked(task_id) => {
-                    assert_eq!(task_id, *self.task_id);
-                    locked_state.set(State::Unlocked(node));
-                }
+                State::Locked(task_id) => debug_assert_eq!(task_id, *self.task_id),
             }
         }
-    }
-}
-
-impl<T> DepCellDataTrait for DepCellData<T> {
-    fn state(&self) -> &Cell<State> {
-        &self.state
     }
 }

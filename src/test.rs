@@ -16,22 +16,13 @@ impl<'tcx> TestCx<'tcx> {
     }
 
     fn add_mir(&mut self) {
-        let cell = self.graph.cell_task((), (), make_mir);
-
-        fn make_mir<'tcx, 'task>((): (),
-                                 (): (),
-                                 task: &mut Task<'task, 'tcx, ()>)
-                                 -> DepCell<Mir<'tcx>>
-        {
-            task.cell(Mir::new()).0
-        }
-
+        let cell = self.graph.new_cell((), (), |(), ()| Mir::new());
         self.mirs.push(cell);
     }
 }
 
 impl DepNodeName for () { }
-impl DepGraphSafe for usize { } 
+impl DepGraphSafe for usize { }
 
 impl<'tcx> DepGraphSafe for TestCx<'tcx> { }
 
@@ -57,14 +48,13 @@ fn basic_usage() {
                                      amount: usize,
                                      task: &mut Task<'task, 'a, ()>) {
         for c in &cx.mirs {
-            let m = task.borrow_mut(c);
+            let mut m = task.borrow_mut(c);
             m.counter += amount;
         }
     }
 }
 
 #[test]
-#[should_panic]
 fn borrow_mut_twice() {
     let mut cx = TestCx::new();
     cx.add_mir();
@@ -93,6 +83,26 @@ fn borrow_twice() {
             task.borrow(c);
             let m = task.borrow(c);
             assert_eq!(m.counter, amount);
+        }
+    }
+}
+
+#[test]
+fn read_by_multiple_tasks() {
+    let mut cx = TestCx::new();
+    cx.add_mir();
+
+    cx.graph.cell_task(&cx, 1, verify_counters);
+    fn verify_counters<'task, 'a, 'tcx>(cx: &'a TestCx<'tcx>,
+                                        amount: usize,
+                                        task: &mut Task<'task, 'a, ()>) {
+        for c in &cx.mirs {
+            task.borrow(c);
+            task.borrow(c);
+
+            if amount > 0 {
+                cx.graph.cell_task(cx, amount - 1, verify_counters);
+            }
         }
     }
 }
